@@ -1,2 +1,2 @@
 # Large reindexed files
-!coord_file.nc
+*.nc

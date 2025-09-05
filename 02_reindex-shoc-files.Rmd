@@ -1,0 +1,415 @@
+---
+title: "Re-indexing SHOC files for OceanParcels"
+author: "Tormey Reimer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(ncdf4)
+library(tidyverse)
+library(geosphere)
+library(here)
+
+here("functions.R") %>% source()
+```
+
+# Introduction
+
+This notebook converts SHOC (Sparse Hydrodynamic Ocean Code) flow field files for use with OceanParcels. The main tasks are:
+
+1. Extract coordinate information from SHOC files and transform to conform to NEMO grid indexing
+2. Create a separate coordinates file (with no data) that parcels expects
+3. Extract flowfield data (2D and 3D) and environmental (tracer) data from SHOC files and ensure that it correctly maps onto the new grid indexing
+
+## Define file paths
+
+The `in_files` are the original flowfield files from SHOC. The `coord_file` is an output filename - parcels prefers to have a separate coordinates file which applies to all the flowfield files, rather than storing duplicate coordinates in all the flowfield files.
+
+```{r file-paths}
+# These are the SHOC files to be re-indexed for parcels
+in_files <- list.files("SHOC_flowfield_files", full.names = T) %>% 
+  str_subset("readme", negate = T) %>% 
+  str_subset("tasse") %>% 
+  str_subset("05-01", negate = T)
+
+# Create output directories if they doesn't exist
+dir.create("RI_flowfield_files/2D", showWarnings = F, recursive = T)
+dir.create("RI_flowfield_files/3D", showWarnings = F, recursive = T)
+dir.create("RI_env_var_files/2D", showWarnings = F, recursive = T)
+dir.create("RI_env_var_files/3D", showWarnings = F, recursive = T)
+
+# This file doesn't exist yet, we're creating it
+coord_file_3D <- "RI_flowfield_files/coord_file_3D.nc"
+coord_file_2D <- "RI_flowfield_files/coord_file_2D.nc"
+```
+
+## Load and examine first flowfield file
+
+Open the first flowfield file to extract coordinate data and define transformations needed.
+
+```{r load-data}
+# Load flowfield data into memory
+ff <- nc_open(in_files[1])
+
+# Extract grid coordinates
+lon_grid <- ncvar_get(ff, "longitude")
+lat_grid <- ncvar_get(ff, "latitude") 
+z_grid <- ncvar_get(ff, "zc")
+botz <- ncvar_get(ff, "botz")
+
+# View ranges
+lon_range <- range(lon_grid, na.rm = TRUE)
+lat_range <- range(lat_grid, na.rm = TRUE)
+
+lon_dist <- distHaversine(p1 = c(lon_range[1], lat_range[1]), c(lon_range[2], lat_range[1]))
+lat_dist <- distHaversine(p1 = c(lon_range[1], lat_range[1]), c(lon_range[1], lat_range[2]))
+cat("botz range:", range(botz, na.rm = TRUE), "\n")
+cat("x_grid range:", lon_range, "--- approx", lon_dist/1000, "km \n")
+cat("y_grid range:", lat_range, "--- approx", lat_dist/1000, "km \n")
+
+# Close the file
+nc_close(ff)
+```
+
+## NEMO vs SHOC Grid Indexing
+
+NEMO is discretised on an Arakawa C-grid. (U and V velocities are not located on the same nodes). To interpolate U, V velocities on a C-grid, parcels needs to read the f-nodes, which are located on the corners of the cells.
+
+According to NEMO's documentation, NEMO is indexed as follows in the horizontal:
+
+```
+ ____V[ij]___.f[ij]
+|            |
+|            |
+|     .T[ij] |U[ij]
+|            |
+|____________|
+```
+
+Where i and j are increasing in the horizontal and vertical directions respectively and T is the location of tracer data. A NEMO cell face will therefore have nodes `[i-1,j-1]`, `[i-1,j]`, `[i,j-1]`, and `[i,j]` forming its bottom-left, top-left, bottom-right, and top-right corners respectively.
+
+By contrast, the SHOC grid is indexed as follows in the horizontal:
+
+```
+      ____________
+     |            |
+     |            |
+U[ij]|     .T[ij] |
+     |            |
+     |.___________|
+ f[ij]    V[ij]
+```
+
+A SHOC cell face will therefore have nodes `[i,j]`, `[i,j+1]`, `[i+1,j]`, and `[i+1,j+1]` forming its bottom-left, top-left, bottom-right, and top-right corners respectively.
+
+Converting these points to SHOC therefore becomes: `NEMO_F[i,j] = SHOC_F[i+1,j+1]`. At the same time, SHOC provides a bit more grid information, the depths are flipped, and a few other transformations are needed.
+
+```{r horizontal-grid}
+# Create corner grids with dimensions increased by 1 in each direction
+lon_corners <- array(NA, dim = dim(lon_grid) + c(1, 1))
+lat_corners <- array(NA, dim = dim(lat_grid) + c(1, 1))
+
+# Calculate half-grid spacings for longitude direction
+dlon_half <- array(NA, dim = dim(lon_grid))
+if(nrow(lon_grid) > 1) {
+  # Interior points: half the spacing to adjacent cells
+  dlon_half[2:(nrow(lon_grid)-1), ] <- abs(lon_grid[3:nrow(lon_grid), ] - lon_grid[1:(nrow(lon_grid)-2), ]) / 4
+  
+  # Edge points: full spacing to the single adjacent cell, divided by 2
+  dlon_half[1, ] <- abs(lon_grid[2, ] - lon_grid[1, ]) / 2
+  dlon_half[nrow(lon_grid), ] <- abs(lon_grid[nrow(lon_grid), ] - lon_grid[nrow(lon_grid)-1, ]) / 2
+} else {
+  dlon_half[1, ] <- 0
+}
+
+# Calculate half-grid spacings for latitude direction  
+dlat_half <- array(NA, dim = dim(lat_grid))
+if(ncol(lat_grid) > 1) {
+  # Interior points: half the spacing to adjacent cells
+  dlat_half[, 2:(ncol(lat_grid)-1)] <- abs(lat_grid[, 3:ncol(lat_grid)] - lat_grid[, 1:(ncol(lat_grid)-2)]) / 4
+  
+  # Edge points: full spacing to the single adjacent cell, divided by 2
+  dlat_half[, 1] <- abs(lat_grid[, 2] - lat_grid[, 1]) / 2
+  dlat_half[, ncol(lat_grid)] <- abs(lat_grid[, ncol(lat_grid)] - lat_grid[, ncol(lat_grid)-1]) / 2
+} else {
+  dlat_half[, 1] <- 0
+}
+
+# Fill the corner grids
+# Bottom-left corners of all original cells
+lon_corners[1:nrow(lon_grid), 1:ncol(lon_grid)] <- lon_grid - dlon_half
+lat_corners[1:nrow(lat_grid), 1:ncol(lat_grid)] <- lat_grid - dlat_half
+
+# Top edge: extend longitude
+lon_corners[nrow(lon_grid)+1, 1:ncol(lon_grid)] <- lon_grid[nrow(lon_grid), ] + dlon_half[nrow(lon_grid), ]
+lat_corners[nrow(lat_grid)+1, 1:ncol(lat_grid)] <- lat_grid[nrow(lat_grid), ] - dlat_half[nrow(lat_grid), ]
+
+# Right edge: extend latitude  
+lon_corners[1:nrow(lon_grid), ncol(lon_grid)+1] <- lon_grid[, ncol(lon_grid)] - dlon_half[, ncol(lon_grid)]
+lat_corners[1:nrow(lat_grid), ncol(lat_grid)+1] <- lat_grid[, ncol(lat_grid)] + dlat_half[, ncol(lat_grid)]
+
+# Top-right corner: extend both directions
+lon_corners[nrow(lon_grid)+1, ncol(lon_grid)+1] <- lon_grid[nrow(lon_grid), ncol(lon_grid)] + dlon_half[nrow(lon_grid), ncol(lon_grid)]
+lat_corners[nrow(lat_grid)+1, ncol(lat_grid)+1] <- lat_grid[nrow(lat_grid), ncol(lat_grid)] + dlat_half[nrow(lat_grid), ncol(lat_grid)]
+
+plot(lon_corners, lat_corners)
+```
+
+```{r vertical-grid}
+k_grid <- rev(z_grid) * -1  # depth needs to be flipped, and sign reversed
+
+# Clip depth - EMS uses sediment/wind but parcels doesn't
+water_inds <- which(k_grid > 0)
+k_grid <- k_grid[water_inds]
+cells_k <- length(k_grid)
+
+cat("Depth grid dimensions:", cells_k, "\n")
+cat("Depth range:", range(k_grid), "\n")
+```
+
+## Create 2D and 3D Grids
+
+```{r create-grids}
+# Create 2D latitude/longitude grids (j x i)
+lat_grid <- lat_corners[2:nrow(lat_corners), 2:ncol(lat_corners)]
+lon_grid <- lon_corners[2:nrow(lon_corners), 2:ncol(lon_corners)]
+
+cells_i <- nrow(lon_grid)
+cells_j <- ncol(lat_grid)
+
+# Create 3D depth grid (k x j x i)
+dep_grid <- array(0, dim = c(cells_k, cells_i, cells_j))
+for (k in 1:cells_k) {
+  dep_grid[k, , ] <- k_grid[k]
+}
+
+cat("Grid shapes:\n")
+cat("lat_grid:", dim(lat_grid), "\n")
+cat("lon_grid:", dim(lon_grid), "\n")
+cat("dep_grid:", dim(dep_grid), "\n")
+```
+
+## Create Coordinates NetCDF File
+
+In the NEMO files, latitude and longitude are stored in a separate file BUT are both 3D (time dimension, with size=1). Depth is stored separately and is 1D, and the data is 4D. It's not really necessary to have a separate coordinates file but it might save some memory, and parcels is expecting it.
+
+```{r create-coord-file}
+# Define dimensions
+dim_i <- ncdim_def("i", "", 1:cells_i)
+dim_j <- ncdim_def("j", "", 1:cells_j)
+dim_k <- ncdim_def("k", "", 1:cells_k)
+
+# Define variables
+var_lat <- ncvar_def("lat_grid", "degrees_north", list(dim_i, dim_j), longname = "Latitude", prec = "float")
+var_lon <- ncvar_def("lon_grid", "degrees_east", list(dim_i, dim_j), longname = "Longitude", prec = "float")
+var_dep <- ncvar_def("dep_grid", "m", list(dim_k, dim_i, dim_j), longname = "Vertical depth", prec = "float")
+
+# Create 3D NetCDF file
+ncout <- nc_create(coord_file_3D, list(var_lat, var_lon, var_dep), force_v4 = TRUE)
+
+# Write data to file
+ncvar_put(ncout, var_lat, lat_grid)
+ncvar_put(ncout, var_lon, lon_grid)
+ncvar_put(ncout, var_dep, dep_grid)
+
+# Add global attributes
+ncatt_put(ncout, var_dep, "positive", "down")
+
+# Close the coordinate file
+nc_close(ncout)
+cat("Coordinate file created:", coord_file_3D, "\n")
+
+# Create 2D NetCDF file
+ncout <- nc_create(coord_file_2D, list(var_lat, var_lon), force_v4 = TRUE)
+
+# Write data to file
+ncvar_put(ncout, var_lat, lat_grid)
+ncvar_put(ncout, var_lon, lon_grid)
+
+# Close the coordinate file
+nc_close(ncout)
+cat("Coordinate file created:", coord_file_2D, "\n")
+```
+
+## Re-index flowfield files
+
+Now that we have the coordinates file and we know what transformations need to be done, we can process all the data. The following transformations need to be made:
+1. In the horizontal, flowfields (both 2D and 3D) need to have the final datapoint in both the i and j directions dropped. This data will be lost but it will ensure that the data correctly maps onto the coordinate file and matches it's dimension sizes.
+2. Tracer data will have the first datapoint in the i and j directions dropped.
+2. In the vertical k dimension, all data (flowfield and tracer) needs to be flipped.
+3. The time dimension of all data must be expressed in total seconds, with the first record of the first file starting at 0 seconds.
+
+```{r flowfield-data}
+for (n in seq_along(in_files)) {
+  # Create filenames
+  in_name <- in_files[n]
+  out_name_2D <- file.path("RI_flowfield_files/2D", basename(in_name))
+  out_name_3D <- file.path("RI_flowfield_files/3D", basename(in_name))
+
+  nc <- nc_open(in_name)
+
+  # Get 3D flowfield data
+  u <- ncvar_get(nc, "u")
+  v <- ncvar_get(nc, "v")
+  # w <- ncvar_get(nc, "w")
+
+  dims <- dim(u)
+  u <- u[1:(dims[1])-1, 1:(dims[2])-1, dims[3]:1, ]
+  v <- v[1:(dims[1])-1, 1:(dims[2])-1, dims[3]:1, ]
+  # w <- w[1:(dims[1])-1, 1:(dims[2])-1, dims[3]:1, ]
+
+  # Transform time (and set start)
+  if (n == 1) {
+    t <- transform_time(nc, start_time = NA)
+    start_time <- get_first_time(nc)
+  } else {
+    t <- transform_time(nc, start_time = start_time)
+  }
+
+  nc_close(nc)
+
+  # Define 3D dimensions
+  dim_i <- ncdim_def("i", "", 1:dim(u)[1])
+  dim_j <- ncdim_def("j", "", 1:dim(u)[2])
+  dim_k <- ncdim_def("k", "", 1:dim(u)[3])
+  dim_t <- ncdim_def("record", "", 1:dim(u)[4])
+
+  # Define variables
+  var_u <- ncvar_def("u", "m2s-1", list(dim_i, dim_j, dim_k, dim_t), longname = "u velocity component", prec = "float")
+  var_v <- ncvar_def("v", "m2s-1", list(dim_i, dim_j, dim_k, dim_t), longname = "v velocity component", prec = "float")
+  # var_w <- ncvar_def("w", "m2s-1", list(dim_i, dim_j, dim_k, dim_t), longname = "w velocity component", prec = "float")
+  var_time <- ncvar_def("time", "seconds", list(dim_t), longname = "Time", prec = "float")
+
+  # Create NetCDF file
+  ncout <- nc_create(
+    out_name_3D,
+    list(var_u, var_v, var_time #, var_w
+    ),
+    force_v4 = TRUE
+  )
+
+  # Write data to 3D file
+  ncvar_put(ncout, var_u, u)
+  ncvar_put(ncout, var_v, v)
+  # ncvar_put(ncout, var_w, w)
+  ncvar_put(ncout, var_time, t)
+
+  # Close the 3D file
+  nc_close(ncout)
+  cat("3D flowfield file created:", out_name_3D, "\n")
+
+  # Define variables in 2D
+  var_u <- ncvar_def("u", "m2s-1", list(dim_i, dim_j, dim_t), longname = "u velocity component", prec = "float")
+  var_v <- ncvar_def("v", "m2s-1", list(dim_i, dim_j, dim_t), longname = "v velocity component", prec = "float")
+  var_time <- ncvar_def("time", "seconds", list(dim_t), longname = "Time", prec = "float")
+
+  # Create NetCDF file
+  ncout <- nc_create(
+    out_name_2D,
+    list(var_u, var_v, var_time),
+    force_v4 = TRUE
+  )
+
+  # Write data to 2D file
+  u2 <- apply(u, c(1, 2, 4), mean, na.rm = TRUE)
+  v2 <- apply(v, c(1, 2, 4), mean, na.rm = TRUE)
+  ncvar_put(ncout, var_u, u2)
+  ncvar_put(ncout, var_v, v2)
+  ncvar_put(ncout, var_time, t)
+
+  # Close the 2D file
+  nc_close(ncout)
+  cat("2D flowfield file created:", out_name_2D, "\n")
+}
+```
+
+```{r tracer-data}
+for (n in seq_along(in_files)) {
+  # Create filenames
+  in_name <- in_files[n]
+  out_name_2D <- file.path("RI_env_var_files/2D", basename(in_name))
+  out_name_3D <- file.path("RI_env_var_files/3D", basename(in_name))
+
+  nc <- nc_open(in_name)
+
+  # Get 3D environmental data
+  temp <- ncvar_get(nc, "temp")
+  salt <- ncvar_get(nc, "salt")
+
+  dims <- dim(temp)
+  temp <- temp[2:dims[1], 2:dims[2], dims[3]:1, ]
+  temp_units <- nc$var$temp$units
+  salt <- salt[2:dims[1], 2:dims[2], dims[3]:1, ]
+  salt_units <- nc$var$temp$units
+
+  # Transform time (and set start)
+  if (n == 1) {
+    t <- transform_time(nc, start_time = NA)
+    start_time <- get_first_time(nc)
+  } else {
+    t <- transform_time(nc, start_time = start_time)
+  }
+
+  nc_close(nc)
+
+  # Define 3D dimensions
+  dim_i <- ncdim_def("i", "", 1:dim(temp)[1])
+  dim_j <- ncdim_def("j", "", 1:dim(temp)[2])
+  dim_k <- ncdim_def("k", "", 1:dim(temp)[3])
+  dim_t <- ncdim_def("record", "", 1:dim(temp)[4])
+
+  # Define variables
+  var_temp <- ncvar_def("temp", temp_units, list(dim_i, dim_j, dim_k, dim_t), longname = "temperature", prec = "float")
+  var_salt <- ncvar_def("salt", salt_units, list(dim_i, dim_j, dim_k, dim_t), longname = "salinity", prec = "float")
+  var_time <- ncvar_def("time", "seconds", list(dim_t), longname = "Time", prec = "float")
+
+  # Create NetCDF file
+  ncout <- nc_create(
+    out_name_3D,
+    list(var_temp, var_salt, var_time #, var_w
+    ),
+    force_v4 = TRUE
+  )
+
+  # Write data to 3D file
+  ncvar_put(ncout, var_temp, temp)
+  ncvar_put(ncout, var_salt, salt)
+  ncvar_put(ncout, var_time, t)
+
+  # Close the 3D file
+  nc_close(ncout)
+  cat("3D environmental file created:", out_name_3D, "\n")
+
+  # Define variables in 2D
+  var_temp <- ncvar_def("temp", temp_units, list(dim_i, dim_j, dim_t), longname = "temperature", prec = "float")
+  var_salt <- ncvar_def("salt", salt_units, list(dim_i, dim_j, dim_t), longname = "salinity", prec = "float")
+  var_time <- ncvar_def("time", "seconds", list(dim_t), longname = "Time", prec = "float")
+
+  # Create NetCDF file
+  ncout <- nc_create(
+    out_name_2D,
+    list(var_temp, var_salt, var_time),
+    force_v4 = TRUE
+  )
+
+  # Write data to 2D file
+  temp2 <- apply(temp, c(1, 2, 4), mean, na.rm = TRUE)
+  salt2 <- apply(salt, c(1, 2, 4), mean, na.rm = TRUE)
+  ncvar_put(ncout, var_temp, temp2)
+  ncvar_put(ncout, var_salt, salt2)
+  ncvar_put(ncout, var_time, t)
+
+  # Close the 2D file
+  nc_close(ncout)
+  cat("2D environmental file created:", out_name_2D, "\n")
+}
+```
+
+
