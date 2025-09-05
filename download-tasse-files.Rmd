@@ -1,0 +1,146 @@
+---
+title: "Download TASSE files from thredds server"
+author: "Tormey Reimer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# library(ncdf4)
+library(tidyverse)
+library(lubridate)
+library(here)
+library(thredds)
+library(wget)
+library(curl)
+```
+
+# Specify thredds details
+
+```{r}
+catalogue <- "https://data-cbr.csiro.au/thredds/catalog/catch_all/oa-sb-recom/tasse-hydro-1.5/catalog.xml"
+out_dir <- here("SHOC_flowfield_files")
+date_names <- seq(make_date(2022, 05, 01), make_date(2022, 05, 31), by = "days") %>% as.character() %>% str_c("tasse_simple_", .)
+```
+
+# Browse the thredds catalogue
+
+```{r}
+# Browse the catalogue to get available datasets
+cat_data <- get_catalog(catalogue)
+```
+
+# Explore catalog structure and filter files
+
+```{r}
+# Explore the structure of cat_data to understand what we're working with
+print("Structure of cat_data:")
+str(cat_data)
+print("Names in cat_data:")
+names(cat_data)
+
+available_files <- cat_data$get_dataset_names()
+
+print(paste("Available files found:", length(available_files)))
+if (length(available_files) > 0) {
+  print("First few files:")
+  print(head(available_files, 10))
+}
+```
+
+```{r}
+# Filter files that contain any of the date_names elements
+if (length(available_files) > 0) {
+  matching_files <- available_files[str_detect(available_files, paste(date_names, collapse = "|"))]
+  
+  print(paste("Found", length(matching_files), "files matching date criteria:"))
+  if (length(matching_files) > 0) {
+    print(matching_files)
+  }
+} else {
+  matching_files <- character(0)
+  print("No files found in catalog")
+}
+```
+
+The following code will skip existing files in the output directory. Note that with the current (daily) files each one is ~450 Mb, so the downloads can take a couple minutes each. With many files, running this script can take a long time. However there are information printouts to keep track of progress.
+
+```{r}
+# Create output directory if it doesn't exist
+dir.create(out_dir, recursive = TRUE, showWarnings = F)
+
+# Download matching files
+if (length(matching_files) > 0) {
+  print("Starting downloads...")
+  
+  for (i in seq_along(matching_files)) {
+    file_name <- matching_files[i]
+    
+    # Construct download URL based on thredds server structure
+    # Most thredds servers follow this pattern for direct file access
+    base_url <- str_replace(catalogue, "/catalog/", "/fileServer/")
+    base_url <- str_replace(base_url, "/catalog.xml", "")
+    
+    # Construct the full download URL
+    download_url <- paste0(base_url, "/", file_name)
+    
+    # Set the local file path - add .nc extension if not present
+    if (!str_detect(file_name, "\\.nc$")) {
+      local_file_path <- file.path(out_dir, paste0(file_name, ".nc"))
+    } else {
+      local_file_path <- file.path(out_dir, file_name)
+    }
+    
+    # Check if file already exists and skip if it does
+    if (file.exists(local_file_path)) {
+      print(paste("⏭ Skipping", file_name, "- file already exists"))
+      next
+    }
+    
+    print(paste("Downloading", file_name, "..."))
+    print(paste("URL:", download_url))
+    print(paste("Destination:", local_file_path))
+    
+    # Download the file (skip if exists)
+    tryCatch({
+      curl_download(download_url, destfile = local_file_path, quiet = FALSE)
+      print(paste("✓ Successfully downloaded:", file_name))
+    }, error = function(e) {
+      print(paste("✗ Failed to download", file_name, ":", e$message))
+      
+      # Try alternative URL construction if first attempt fails
+      alt_download_url <- str_replace(catalogue, "catalog.xml", paste0("fileServer/", file_name))
+      print(paste("Trying alternative URL:", alt_download_url))
+      
+      tryCatch({
+        curl_download(alt_download_url, destfile = local_file_path, quiet = FALSE)
+        print(paste("✓ Successfully downloaded with alternative URL:", file_name))
+      }, error = function(e2) {
+        print(paste("✗ Alternative URL also failed:", e2$message))
+      })
+    })
+  }
+  
+  print("Download process completed!")
+  
+  # List downloaded files
+  downloaded_files <- list.files(out_dir, pattern = "*.nc", full.names = FALSE)
+  print(paste("Files in output directory:", length(downloaded_files)))
+  if (length(downloaded_files) > 0) {
+    print(downloaded_files)
+  }
+  
+} else {
+  print("No matching files found to download.")
+}
+```
+
+```{r}
+
+```
